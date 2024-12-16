@@ -23,7 +23,6 @@ import pandas as pd
 from functools import partial
 import dgl
 import warnings
-import wandb
 import yaml
 warnings.filterwarnings("ignore")
 
@@ -89,16 +88,25 @@ def create_model(args, e_ts):
             
     return tmp_model
 
+def compute_class_weights(graph, beta=0.999):
+    """计算类别权重以应对类别不平衡问题."""
+    labels = graph.ndata['label'].cpu().numpy()
+    num_classes = len(np.unique(labels))
+    class_counts = np.bincount(labels, minlength=num_classes)
+    effective_num = 1.0 - np.power(beta, class_counts)
+    weights = (1.0 - beta) / effective_num
+    weights = weights / np.sum(weights) * num_classes  # 归一化
+    return torch.tensor(weights, dtype=torch.float32).to(graph.device)
 
-def UDA_train_epoch(epoch, model, loss_func, graph, label_loader, unlabel_loader, optimizer, augmentor, args):
+def UDA_train_epoch(epoch, model, loss_func, graph, label_loader, unlabel_loader, optimizer, augmentor, args, class_weights):
     model.train()
     num_iters = args['train-iterations']
-    
+
     sampler, attn_drop, ad_optim = augmentor
-    
+
     unlabel_loader_iter = iter(unlabel_loader)
     label_loader_iter = iter(label_loader)
-    
+
     for idx in range(num_iters):
         try:
             label_idx = label_loader_iter.__next__()
@@ -121,80 +129,47 @@ def UDA_train_epoch(epoch, model, loss_func, graph, label_loader, unlabel_loader
                 weak_logits = model.proj_out(weak_h)
                 u_pred_weak_log = weak_logits.log_softmax(dim=-1)
                 u_pred_weak = u_pred_weak_log.exp()[:, 1]
-                
+
             pseudo_labels = torch.ones_like(u_pred_weak).long()
             neg_tar = (u_pred_weak <= (args['normal-th']/100.)).bool()
             pos_tar = (u_pred_weak >= (args['fraud-th']/100.)).bool()
             pseudo_labels[neg_tar] = 0
             pseudo_labels[pos_tar] = 1
             u_mask = torch.logical_or(neg_tar, pos_tar)
-
-            model.train()
-            attn_drop.train()
-            for param in model.parameters():
-                param.requires_grad = False
-            for param in attn_drop.parameters():
-                param.requires_grad = True
-
-            _, _, u_blocks = fixed_augmentation(graph, unlabel_idx.to(args['device']), sampler, aug_type='drophidden')
-
-            inter_results = model(u_blocks, update_bn=False, return_logits=True)
-            dropped_results = [inter_results[0]]
-            for i in range(1, len(inter_results)):
-                dropped_results.append(attn_drop(inter_results[i]))
-            h = torch.stack(dropped_results, dim=1)
-            h = h.reshape(h.shape[0], -1)
-            logits = model.proj_out(h)
-            u_pred = logits.log_softmax(dim=-1)
-            
-            consistency_loss = nll_loss_raw(u_pred, pseudo_labels, pos_w=1.0, reduction='none')
-            consistency_loss = torch.mean(consistency_loss * u_mask)
-
-            if args['diversity-type'] == 'cos':
-                diversity_loss = F.cosine_similarity(weak_h, h, dim=-1)
-            elif args['diversity-type'] == 'euc':
-                diversity_loss = F.pairwise_distance(weak_h, h)
-            else:
-                raise
-            diversity_loss = torch.mean(diversity_loss * u_mask)
-            
-            total_loss = args['trainable-consis-weight'] * consistency_loss - diversity_loss + args['trainable-weight-decay'] * l2_regularization(attn_drop)
-            
-            ad_optim.zero_grad()
-            total_loss.backward()
-            ad_optim.step()
-            
-            for param in model.parameters():
-                param.requires_grad = True
-            for param in attn_drop.parameters():
-                param.requires_grad = False
-
-            inter_results = model(u_blocks, update_bn=False, return_logits=True)
-            dropped_results = [inter_results[0]]
-            for i in range(1, len(inter_results)):
-                dropped_results.append(attn_drop(inter_results[i], in_eval=True))
-
-            h = torch.stack(dropped_results, dim=1)
-            h = h.reshape(h.shape[0], -1)
-            logits = model.proj_out(h)
-            u_pred = logits.log_softmax(dim=-1)
-
-            unsup_loss = nll_loss_raw(u_pred, pseudo_labels, pos_w=1.0, reduction='none')
-            unsup_loss = torch.mean(unsup_loss * u_mask)
         else:
-            unsup_loss = 0.0
+            label_idx = label_loader_iter.__next__()
+            pseudo_labels = None
+            u_mask = None
 
+        model.train()
         _, _, s_blocks = fixed_augmentation(graph, label_idx.to(args['device']), sampler, aug_type='none')
         s_pred = model(s_blocks)
         s_target = s_blocks[-1].dstdata['label']
             
-        sup_loss, _ = loss_func(s_pred, s_target)
+        # 使用类别权重计算监督损失
+        sup_loss = loss_func(s_pred, s_target, class_weights=class_weights)
 
-        loss = sup_loss + unsup_loss + args['weight-decay'] * l2_regularization(model)
+        if epoch > args['trainable-warm-up']:
+            u_pred, _ = model(u_blocks)
+            u_target = pseudo_labels
+
+            # 使用类别权重和伪标签计算无标签数据集的损失
+            if pseudo_labels is not None:
+                u_pred = u_pred[u_mask]
+                u_target = pseudo_labels[u_mask]
+                u_loss = loss_func(u_pred, u_target, class_weights=class_weights[u_target])
+            else:
+                u_loss = 0
+
+            loss = sup_loss + u_loss + args['weight-decay'] * l2_regularization(model)
+        else:
+            loss = sup_loss
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()     
+
+    print(f"Epoch {epoch + 1}, Loss: {sup_loss.item():.4f}")
         
 
 def get_model_pred(model, graph, data_loader, sampler, args):
@@ -221,14 +196,14 @@ def get_model_pred(model, graph, data_loader, sampler, args):
 def val_epoch(epoch, model, graph, valid_loader, test_loader, sampler, args):
     valid_dict = {}
     valid_pred, valid_target = get_model_pred(model, graph, valid_loader, sampler, args)
-    v_roc, v_pr, _, _, _, _, v_f1, v_thre = eval_pred(valid_pred, valid_target)
+    v_roc, v_pr, _, _, _, v_f1, v_thre = eval_pred(valid_pred, valid_target)
     valid_dict['auc-roc'] = v_roc
     valid_dict['auc-pr'] = v_pr
     valid_dict['marco f1'] = v_f1
         
     test_dict = {}
     test_pred, test_target = get_model_pred(model, graph, test_loader, sampler, args)
-    t_roc, t_pr, _, _, _, _, _, _ = eval_pred(test_pred, test_target)
+    t_roc, t_pr, _, _, _, _, _ = eval_pred(test_pred, test_target)
     test_dict['auc-roc'] = t_roc
     test_dict['auc-pr'] = t_pr
     
@@ -250,6 +225,9 @@ def run_model(args):
                                                                                            shuffle_train=args['shuffle-train'], 
                                                                                            to_homo=args['to-homo'])
     graph = graph.to(args['device'])
+
+    # 计算类别权重
+    class_weights = compute_class_weights(graph, beta=args.get('class-weight-beta', 0.75))
     
     args['node-in-dim'] = graph.ndata['feature'].shape[1]
     args['node-out-dim'] = 2
@@ -275,7 +253,7 @@ def run_model(args):
     
     best_val = sys.float_info.min
     for epoch in range(args['epochs']):
-        train_epoch(epoch, my_model, task_loss, graph, label_loader, unlabel_loader, optimizer, augmentor, args)
+        train_epoch(epoch, my_model, task_loss, graph, label_loader, unlabel_loader, optimizer, augmentor, args, class_weights)
         val_results, test_results = val_epoch(epoch, my_model, graph, valid_loader, test_loader, sampler, args)
         
         if val_results['auc-roc'] > best_val:
@@ -286,6 +264,7 @@ def run_model(args):
                 m_utls.store_model(my_model, args)
                 
     return list(test_in_best_val.values())
+
 
 
 def get_config(config_path="config.yml"):
@@ -320,4 +299,3 @@ if __name__ == '__main__':
     print(mean_results)
     print(std_results)
     print('total time: ', time.time()-start_time)
-    
